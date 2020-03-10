@@ -9,9 +9,9 @@ import seaborn
 
 from torch_scatter import scatter_add
 
-SELF_LOOP = True
-CHEAT = True
-CHEAT_DIAG = True
+SELF_LOOP = False
+CHEAT = False
+CHEAT_DIAG = False
 
 '''
 Code taken from http://nlp.seas.harvard.edu/2018/04/03/attention.html
@@ -206,8 +206,7 @@ class graph_decoder(nn.Module):
         lt_adj_mat = lt_adj_mat.squeeze(1)
 
         ### build node features (elementwise op)
-        # TAG:
-        node_feat_ = self.mlp_in(node_feat)
+        node_feat = self.mlp_in(node_feat)
 
         ### graph stuff
         x, y = self.decode(node_feat, ar_mask, lt_adj_mat)
@@ -275,18 +274,16 @@ class Decoder(nn.Module):
         self.norm_y = LayerNorm(layer.size)
 
     def forward(self, x, ar_mask, lt_adj_mat):
-        return x, torch.ones_like(x) * -1
-        import pdb; pdb.set_trace()
         for i, (layer_x, layer_y) in enumerate(zip(self.layers_x, self.layers_y)):
             # 1) we do the regular GAT-ish connection using the regular graph
             # this performs a x' = x + LayerNorm(self_att(x))
             x = layer_x(x, lt_adj_mat)
 
             if i == 0:
-                y = x # layer_y(x, ar_mask)
+                y = layer_y(x, ar_mask)
             else:
                 #### HERE : remove the left part
-                y = y# + layer_y(x, ar_mask)
+                y = y + layer_y(x, ar_mask)
                 #y = layer_y(x, ar_mask)
 
         return self.norm_x(x), self.norm_y(y)
