@@ -32,6 +32,8 @@ class GRANData(object):
     self.num_subgraph_batch = config.dataset.num_subgraph_batch
     self.is_overwrite_precompute = config.dataset.is_overwrite_precompute
 
+    self.transformer = config.dataset.transformer if hasattr(config.dataset, 'transformer') else False
+
     if self.is_sample_subgraph:
       assert self.num_subgraph_batch > 0
 
@@ -147,6 +149,10 @@ class GRANData(object):
 
     # load graph
     adj_list = pickle.load(open(self.file_names[index], 'rb'))
+
+    if self.transformer:
+        return adj_list
+
     num_nodes = adj_list[0].shape[0]
     num_subgraphs = int(np.floor((num_nodes - K) / S) + 1)
 
@@ -179,7 +185,7 @@ class GRANData(object):
       edges = []
       node_idx_gnn = []
       node_idx_feat = []
-      label = []      
+      label = []
       subgraph_size = []
       subgraph_idx = []
       att_idx = []
@@ -197,6 +203,7 @@ class GRANData(object):
 
           ### for each size-(jj+K) subgraph, we generate edges for the new block of K nodes
           if jj + K > num_nodes:
+            # (Lucas) when do we get here ?
             break
 
           if idx not in rand_idx:
@@ -259,13 +266,14 @@ class GRANData(object):
       ### adjust index basis for the selected subgraphs
       cum_size = np.cumsum([0] + subgraph_size).astype(np.int64)
       for ii in range(len(edges)):
-        edges[ii] += cum_size[ii]
+        # edges[ii] += cum_size[ii]
+        edges[ii] = edges[ii] + cum_size[ii]
         node_idx_gnn[ii] += cum_size[ii]
 
       ### pack tensors
       data = {}
       data['adj'] = np.tril(np.stack(adj_list, axis=0), k=-1)
-      data['edges'] = torch.cat(edges, dim=1).t()
+      data['edges'] = torch.cat(edges, dim=1).t().long()
       data['node_idx_gnn'] = np.concatenate(node_idx_gnn)
       data['node_idx_feat'] = np.concatenate(node_idx_feat)
       data['label'] = np.concatenate(label)
@@ -292,6 +300,28 @@ class GRANData(object):
     N = self.max_num_nodes
     C = self.num_canonical_order
     batch_data = []
+
+    if self.transformer:
+        assert len(batch[0]) == 1, 'only supporting 1 ordering for now'
+
+        data = {}
+        lens = [x[0].shape[0] for x in batch]
+        max_ = self.max_num_nodes # max(lens)
+        pad  = [max_ - len_ for len_ in lens]
+
+        data['adj'] = torch.from_numpy(
+            np.stack(
+                [
+                    np.pad(
+                        adj[0][None], ((0, 0), (0, pad[ii]), (0, pad[ii])),
+                        'constant',
+                        constant_values=0.0) for ii, adj in enumerate(batch)
+                ],
+                axis=0)).float()  # B X C X N X N
+        data['lens'] = lens
+
+        return data
+
 
     for ff in range(self.num_fwd_pass):
       data = {}
@@ -322,7 +352,7 @@ class GRANData(object):
 
       data['edges'] = torch.cat(
           [bb['edges'] + idx_base[ii] for ii, bb in enumerate(batch_pass)],
-          dim=0)
+          dim=0).long()
 
       data['node_idx_gnn'] = torch.from_numpy(
           np.concatenate(
@@ -359,5 +389,5 @@ class GRANData(object):
 
     end_time = time.time()
     # print('collate time = {}'.format(end_time - start_time))
-    
+
     return batch_data
