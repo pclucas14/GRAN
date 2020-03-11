@@ -83,36 +83,48 @@ def evaluate(graph_gt, graph_pred, degree_only=True):
 def preprocess(data, lens):
     lens = torch.LongTensor(lens).to(data.device)
 
-    # extract length of every batch
-    tri_with_diag = torch.tril(torch.ones(data.shape[-2:])).to(data.device)
-    diag_idx = torch.arange(data.size(-1))
+    # subsample a subgraph for every adjacency matrix
+    lens = (torch.ones_like(lens).float().uniform_(0, 1) * lens.float()).long().clamp_(min=1)
 
-    tri_no_diag = tri_with_diag.clone()
-    # set the diagonal to 0
-    tri_no_diag[diag_idx, diag_idx] = 0
+    ### build node features
 
-    # add channel axis to masks
-    tri_no_diag   = tri_no_diag.unsqueeze(0).unsqueeze(0)
-    tri_with_diag = tri_with_diag.unsqueeze(0).unsqueeze(0)
-
-    tri_no_diag   = tri_no_diag.expand(data.size(0),   -1, -1, -1)
-    tri_with_diag = tri_with_diag.expand(data.size(0), -1, -1, -1)
-
-    node_features = data * tri_with_diag
-    ar_att_mask   = tri_no_diag * data
-    ar_mask       = tri_no_diag
-
-    # mask out the padded tokens
+    # 1) mask len - 1 (since you are predicting at index == len), if lens[i] = 10 ,
+    # mask at index 10, 11, 12, ... and predict index = 10
     tmp = torch.zeros(data.size(0), data.size(-2), data.size(-1)).to(data.device)
     tmp[torch.arange(data.size(0)), lens, :] = 1
     tmp[torch.arange(data.size(0)), :, lens] = 1
+    len_m1_mask = 1 - (tmp.cumsum(-1).cumsum(-2) > 0).byte()
+    len_m1_mask = len_m1_mask.unsqueeze(1)
+
+    # 2) mask adjacency matrix past the node feature you are trying to predict
+    node_feat = data * len_m1_mask # this will initialize to-be-predicted nodes with 0's (ok)
+
+    ### build attention mask for GCN-like convolutions
+
+    # 1) only attend to neigbhbouring nodes
+    diag = torch.zeros_like(data)
+    diag[:, :, torch.arange(data.size(-2)), torch.arange(data.size(-1))] = 1
+
+    # (include self connections)
+    attn_mask = (data + diag) * len_m1_mask
+
+    # (to not include self connection : )
+    # attn_mask = data * len_m1_mask
+
+
+    # 2) add dummy edges from the node-to-be-predicted to all previous nodes
+    tmp = torch.zeros(data.size(0), data.size(-2), data.size(-1)).to(data.device)
+    tmp[torch.arange(data.size(0)), lens + 1, :] = 1
+    tmp[torch.arange(data.size(0)), :, lens + 1] = 1
     len_mask = 1 - (tmp.cumsum(-1).cumsum(-2) > 0).byte()
     len_mask = len_mask.unsqueeze(1)
 
-    # TODO: unmask the last step so the model learns to predict nodes with no edges (i.e. learns to stop)
-    ar_mask = ar_mask * len_mask
+    only_to_be_predicted = len_mask - len_m1_mask
 
-    return node_features, ar_mask, ar_att_mask, len_mask
+    # 3) combine edges for already-generated nodes and to-be-predicted nodes
+    attn_mask = attn_mask + only_to_be_predicted
+
+    return node_feat, attn_mask, lens
 
 
 class TransformerRunner(object):
@@ -204,7 +216,7 @@ class TransformerRunner(object):
     # create models
     # model = eval(self.model_conf.name)(self.config)
     from model.transformer import make_model
-    model = make_model(d_out=20 * 2, N=10, d_model=1024) # d_out, N, d_model, d_ff, h
+    model = make_model(d_out=1, N=10, d_model=256, d_ff=32, dropout=0.5) # d_out, N, d_model, d_ff, h
 
     if self.use_gpu:
       model = DataParallel(model, device_ids=self.gpus).to(self.device)
@@ -277,38 +289,14 @@ class TransformerRunner(object):
               adj  = adj.to('cuda:%d' % gpu_id)
 
               # build masks
-              node_feat, ar_mask, lt_adj_mat, len_mask = preprocess(adj, lens)
-              batch_fwd.append((node_feat, ar_mask.clone(), lt_adj_mat.clone()))
+              node_feat, attn_mask, lens = preprocess(adj, lens)
+              batch_fwd.append((node_feat, attn_mask.clone(), lens))
 
           if batch_fwd:
+            node_feat, attn_mask, lens = batch_fwd[0]
             log_theta, log_alpha = model(*batch_fwd)
-            node_feat, ar_mask, lt_adj_mat = batch_fwd[0]
 
-            # it remains to properly extra lower triangular part and flatten it
-
-            # 1) build a list of indices containing ALL elements
-            all_idx = torch.arange(len_mask.numel()).to(len_mask.device).view_as(len_mask)
-
-            # 2) build a tensor allowing you to keep track of which Adj row edges belong
-            edge_idx = torch.arange(all_idx[:, :, :, 0].numel()).to(len_mask.device)
-            edge_idx = edge_idx.view_as(all_idx[:, :, :, 0])
-            edge_idx = edge_idx.unsqueeze(-1).expand(-1, -1, -1, all_idx.size(-1))
-
-            # 3) remove the upper triangular part AND remove the padded nodes
-            # TODO: don't remove self loops
-            all_idx = all_idx * ar_mask.long()
-            all_idx = all_idx.flatten()
-
-            all_idx = all_idx[all_idx != 0]
-
-            log_theta = log_theta.reshape(-1, log_theta.size(-1))[all_idx]
-            log_alpha = log_alpha.reshape(-1, log_alpha.size(-1))[all_idx]
-
-            # label is simply the adjacency matrix value
-            label    = adj.flatten()[all_idx]
-            edge_idx = edge_idx.flatten()[all_idx]
-
-            train_loss = model.module.mix_bern_loss(log_theta, log_alpha, label, edge_idx)
+            train_loss = model.module.mix_bern_loss(log_theta, log_alpha, adj, lens)
 
             avg_train_loss += train_loss
 
@@ -329,7 +317,7 @@ class TransformerRunner(object):
         if iter_count % self.train_conf.display_iter == 0 or iter_count == 1:
           logger.info("NLL Loss @ epoch {:04d} iteration {:08d} = {}".format(epoch + 1, iter_count, train_loss))
 
-        if epoch % 10 == 0 and inner_iter == 0:
+        if epoch % 50 == 0 and inner_iter == 0:
           model.eval()
           print('saving graphs')
           graphs_gen = [get_graph(adj[0].cpu().data.numpy())] + [get_graph(aa.cpu().data.numpy()) for aa in model.module.sample(9)]

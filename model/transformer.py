@@ -10,8 +10,6 @@ import seaborn
 from torch_scatter import scatter_add
 
 SELF_LOOP = False
-CHEAT = False
-CHEAT_DIAG = False
 
 '''
 Code taken from http://nlp.seas.harvard.edu/2018/04/03/attention.html
@@ -23,60 +21,57 @@ class graph_decoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
-    def __init__(self, decoder, mlp_in, edge_mlp, output_theta, output_alpha):
+    def __init__(self, decoder, mlp_in, output_theta, output_alpha):
         super(graph_decoder, self).__init__()
         self.decoder    = decoder
         self.mlp_in     = mlp_in
-        self.edge_mlp   = edge_mlp
         self.output_theta = output_theta
         self.output_alpha = output_alpha
         self.self_loop  = SELF_LOOP
 
-    def mix_bern_loss(self, log_theta, log_alpha, label, edge_idx):
-        log_theta = log_theta
-        log_alpha = log_alpha
+    def mix_bern_loss(self, log_theta, log_alpha, adj, lens):
 
-        K = log_theta.size(-1)
-        edge_idx_exp = edge_idx.unsqueeze(1).expand(-1, K)
+        B, N, K = log_theta.size()
+        adj = adj.squeeze(1)
 
-        # individual loss for every mixture
+        # we are going to need a mask to mask out nodes after the one being predicted
+        # remember : we are predicting the connections for the node at index len[i] for i
+        valid_edges = torch.zeros(B, N).to(adj.device)
+        valid_edges[torch.arange(B), lens + 1] = 1
+        valid_edges = 1 - valid_edges.cumsum(1)
+
+        # build label
+        label = adj[torch.arange(B), lens]
+
+        ### individual loss for every mixture
         adj_loss = F.binary_cross_entropy_with_logits(\
-                log_theta, label.view(-1, 1).expand(-1, K), reduction='none')
-        reduce_adj_loss = scatter_add(adj_loss, edge_idx, 0)
+                log_theta.view(-1, K), label.unsqueeze(-1).expand(-1, -1, K).view(-1, K), reduction='none')
+        adj_loss = adj_loss.view(B, -1, K)
 
-        reduce_log_alpha = scatter_add(log_alpha, edge_idx, 0)
-        count = scatter_add(torch.ones_like(edge_idx), edge_idx, dim=0)
+        # mask out padded noded / nodes after the one to be predicted
+        adj_loss = adj_loss * valid_edges.unsqueeze(-1)
 
-        """ NOTE: edge_idx does leaps (e.g
-        (Pdb) edge_idx[1020:1060]
-        tensor([ 45,  45,  45,  45,  45,  45,  45,  45,  45,  45,  45,  45,  45,  45,
-                 45, 101, 102, 102, 103, 103, 103, 104, 104, 104, 104, 105, 105, 105,
-                105, 105, 106, 106, 106, 106, 106, 106, 107, 107, 107, 107],
-               device='cuda:0')
-        this is because the indices are assigned before filtering out the padded rows
-        we remove them
+        # and reduce / sum per row
+        adj_loss = adj_loss.sum(1)
+
+        """ equivalent to
+        out = torch.stack([F.binary_cross_entropy_with_logits(log_theta[:, :, i], label, reduction='none')
+             for i in range(K)], -1)
         """
 
-        valid_idx = count.nonzero().squeeze()
+        ### build alphas
 
-        reduce_log_alpha = reduce_log_alpha[valid_idx]
-        reduce_adj_loss  = reduce_adj_loss[valid_idx]
-        count            = count[valid_idx].unsqueeze(-1)
+        # we want to pool together the mixtures coming from the same subgraph,
+        # i.e. coming from the same row prediction
+        log_alpha = log_alpha * valid_edges.unsqueeze(-1)
 
-        # depending on the row, different amount of nodes are added up to build alphas and thetas
-        # it's important to that the average of the alphas to make sure were always on the same scale
-        log_alpha  = reduce_log_alpha / count
-
-        ### HERE
+        # average over pooled nodes
+        log_alpha = log_alpha.sum(1) / lens.view(-1, 1)
         log_alpha = F.log_softmax(log_alpha, -1)
 
-        # return reduce_adj_loss.mean(1).sum() / log_theta.shape[0]
-        # log_alpha = torch.Tensor([1./20.]).to(log_alpha.device).view(1, 1).expand(-1, 20)
-        # log_alpha = log_alpha.log()
-
-        log_prob = -reduce_adj_loss + log_alpha
+        log_prob = -adj_loss + log_alpha
         log_prob = torch.logsumexp(log_prob, 1)
-        return - log_prob.sum() / log_theta.shape[0]
+        return - log_prob.sum() / lens.sum().float()
 
 
     def sample(self, n_samples=64, max_node=100):
@@ -84,148 +79,95 @@ class graph_decoder(nn.Module):
         with torch.no_grad():
 
             # build node features
-            node_feat = torch.zeros(n_samples, max_node, max_node).to('cuda:0')
+            adj = torch.zeros(n_samples, max_node, max_node).to('cuda:0')
 
             # build ar mask
-            ar_mask = torch.tril(torch.ones(max_node, max_node)).to(node_feat.device)
-            diag_idx = torch.arange(max_node)
-            ar_mask[diag_idx, diag_idx] = 0
-            ar_mask = ar_mask.unsqueeze(0).expand(n_samples, -1, -1)
+            attn_mask = torch.zeros(1, max_node, max_node).to(adj.device)
+            valid_edges = torch.zeros(1, max_node).to(adj.device)
 
-            # build lt_adj_mat
-            lt_adj_mat = node_feat.clone().long()
+            # assuming no self loops, we can start at the second node (i = 1)
+            ### TODO: put this bach
+            for ii in range(1, 50): #max_node):
 
-            if SELF_LOOP:
-                # SELF EDGES
-                ar_mask[:, torch.arange(100), torch.arange(100)] = 1
-                lt_adj_mat[:, torch.arange(100), torch.arange(100)] = 1
+                # rows ii: are already zeros (line 82)
+                node_feat = adj.float()
 
-            for ii in range(1, max_node):
+                # add dummy edges
+                attn_mask[:, ii, :ii+1] = 1
+                attn_mask[:, :ii+1, ii] = 1
+
+                # add self loops
+                # to not include self connection, uncomment this line
+                attn_mask[:, torch.arange(ii), torch.arange(ii)] = 1
 
                 usq = lambda x : x.unsqueeze(1)
-                log_theta, log_alpha = self(usq(node_feat), usq(ar_mask), usq(lt_adj_mat))
+                lens = torch.ones(n_samples).to(node_feat.device) * ii
+                log_theta, log_alpha = self(usq(node_feat), usq(attn_mask), lens.long())
 
-                ### sample_alpha values
-                log_alpha = log_alpha[:, ii, :ii]
+                # we are going to need a mask to mask out nodes after the one being predicted
+                # remember : we are predicting the connections for the node at index len[i] for i
+                # (include ii)
+                valid_edges[:, :ii+1] = 1
 
-                # the number of dummy edges is simply (ii+1) - 1, since we don't have self loops
-                log_alpha = log_alpha / ii
-                ### HERE normalize after div.
-                log_alpha = F.log_softmax(log_alpha, -1)
+                # mask out irrelevant tokens
+                log_alpha = log_alpha * valid_edges.unsqueeze(-1)
+                log_alpha = log_alpha.sum(1) / ii
+                alpha     = F.softmax(log_alpha, -1)
+                alpha     = torch.multinomial(alpha, 1).squeeze(1)
 
-                # alpha : (n_samples * ii, )
-                alpha = torch.multinomial(log_alpha.view(-1, log_alpha.size(-1)).exp(),
-                        num_samples=1).squeeze(-1)#.reshape(log_alpha.shape[:2])
+                log_theta = log_theta[torch.arange(n_samples), :, alpha]
+                log_theta = log_theta[:, :ii+1]
 
-                print('unique alphas ', alpha.unique())
+                # Temperature tuning
+                log_theta = log_theta * 2
 
-                ### build theta values
-                log_theta = log_theta[:, ii, :ii]
-                log_theta = log_theta.reshape(-1, log_theta.size(-1))[torch.arange(alpha.size(0)), alpha]
-                theta = F.sigmoid(log_theta).reshape(log_alpha.shape[:2])
 
-                ### only do a single mixture
-                # theta = F.sigmoid(log_theta[:, ii, :ii, 0])
+                theta     = torch.sigmoid(log_theta)
 
                 sampled_edges = torch.bernoulli(theta)
 
-                ### update the current graph data structure
+                adj[:, ii, :ii+1] = sampled_edges
 
-                # attention mask
-                lt_adj_mat[:, ii, :ii] = sampled_edges.long()
+                adj = (adj + adj.transpose(-2, -1)).clamp_(max=1)
 
-                if SELF_LOOP:
-                    lt_adj_mat[:, ii, ii] = 1
-                else:
-                    node_feat = lt_adj_mat.clone().float()
-
-                if CHEAT:
-                    node_feat = lt_adj_mat.clone().float()
-
-            adj_mat = lt_adj_mat + lt_adj_mat.transpose(-2,-1)
-
-            return adj_mat
+            return adj
 
 
         # we can actually start our loop at i == 1 since we assume there is no self loops
 
-    def forward(self, node_feat, ar_mask, lt_adj_mat):
-
-        # TODO: investigate this:
-        # actually, add self loops but zero features
-
-        if SELF_LOOP or CHEAT_DIAG:
-            # SELF EDGES
-            ### HERE
-            if not CHEAT: node_feat = node_feat * 0
-            ar_mask[:, :, torch.arange(100), torch.arange(100)] = 1
-            lt_adj_mat[:, :, torch.arange(100), torch.arange(100)] = 1
-
-            ar_mask = lt_adj_mat = torch.ones_like(ar_mask)
-
-        """
-        node_feat : bs, 1, N, N adjacency matrix
-
-        given the adjacency matrix, ADJ=
-            [ 0 1 0 0 1 ]
-            [ 1 0 1 0 0 ]
-            [ 0 1 1 1 0 ]
-            [ 0 0 1 0 0 ]
-            [ 1 0 0 0 0 ]
-
-        we build
-        1) the node features, which is the lower triangular part of Adj
-            [ 0 0 0 0 0 ]
-            [ 1 0 0 0 0 ]
-            [ 0 1 1 0 0 ]
-            [ 0 0 1 0 0 ]
-            [ 1 0 0 0 0 ]
-
-        2) the attention masks. We need to be careful of avoiding self loops,
-           since the node features for node i is the target of node i
-           a) the autoregressive mask for the dummy edges, ARM=
-            [ 0 0 0 0 0 ]
-            [ 1 0 0 0 0 ]
-            [ 1 1 0 0 0 ]
-            [ 1 1 1 0 0 ]
-            [ 1 1 1 1 0 ]
-
-           b) the autoregressive attention mask
-           which is equal to ARM * ADJ
-            [ 0 0 0 0 0 ]
-            [ 1 0 0 0 0 ]
-            [ 0 1 0 0 0 ]
-            [ 0 0 1 0 0 ]
-            [ 1 0 0 0 0 ]
-        """
+    def forward(self, node_feat, attn_mask, lens):
+        B, _, N, D = node_feat.size()
 
         # remove channel dim
         # TODO: move this in `preprocess`
         node_feat  = node_feat.squeeze(1)
-        ar_mask    = ar_mask.squeeze(1)
-        lt_adj_mat = lt_adj_mat.squeeze(1)
+        attn_mask    = attn_mask.squeeze(1)
 
         ### build node features (elementwise op)
         node_feat = self.mlp_in(node_feat)
 
         ### graph stuff
-        x, y = self.decode(node_feat, ar_mask, lt_adj_mat)
+        x = self.decode(node_feat, attn_mask)
 
-        ### now that we have node features for every node, we need to build the edge difference
-        edge_x, edge_y = self.edge_mlp(torch.cat((x, y))).chunk(2)
+        predicted_node_feat  = x[torch.arange(B), lens]
 
-        # (bs, N, N, D)
-        all_diffs = edge_y.unsqueeze(1) - edge_x.unsqueeze(2)
+        diff = predicted_node_feat.unsqueeze(1) - x
 
-        # we only need the lower triangular part of the (_, N, N, _) matrix
-        # TODO: don't push useless calculations
+        """
+        # botch (bs, N, D)
+        log_theta = self.output_theta(diff)
+        log_alpha = self.output_alpha(diff)
+        """
 
-        return self.output_theta(all_diffs), self.output_alpha(all_diffs)
+        log_theta = self.output_theta(diff)
+        log_alpha = self.output_alpha(diff)
+
+        return log_theta, log_alpha
 
 
-    def decode(self, x, ar_mask, lt_adj_mat):
+    def decode(self, x, attn_mask):
         # tgt = self.tgt_embed(tgt)
-        return self.decoder(x, ar_mask, lt_adj_mat)
+        return self.decoder(x, attn_mask)
 
 
 def clones(module, N):
@@ -269,24 +211,15 @@ class Decoder(nn.Module):
     def __init__(self, layer, N):
         super(Decoder, self).__init__()
         self.layers_x = clones(layer, N)
-        self.layers_y = clones(layer, N)
         self.norm_x = LayerNorm(layer.size)
-        self.norm_y = LayerNorm(layer.size)
 
-    def forward(self, x, ar_mask, lt_adj_mat):
-        for i, (layer_x, layer_y) in enumerate(zip(self.layers_x, self.layers_y)):
+    def forward(self, x, attn_mask):
+        for i, layer_x in enumerate(self.layers_x):
             # 1) we do the regular GAT-ish connection using the regular graph
             # this performs a x' = x + LayerNorm(self_att(x))
-            x = layer_x(x, lt_adj_mat)
+            x = layer_x(x, attn_mask)
 
-            if i == 0:
-                y = layer_y(x, ar_mask)
-            else:
-                #### HERE : remove the left part
-                y = y + layer_y(x, ar_mask)
-                #y = layer_y(x, ar_mask)
-
-        return self.norm_x(x), self.norm_y(y)
+        return self.norm_x(x)
 
 
 class DecoderLayer(nn.Module):
@@ -312,7 +245,6 @@ def subsequent_mask(size):
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     return torch.from_numpy(subsequent_mask) == 0
 
-306532
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
@@ -373,7 +305,7 @@ class PositionwiseFeedForward(nn.Module):
 
 
 def make_model(d_out=100, N=6,
-        d_model=512, d_ff=2048, h=8, dropout=0.5): # 0.1):
+        d_model=512, d_ff=2048, h=8, dropout=0.3): # 0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
@@ -382,20 +314,24 @@ def make_model(d_out=100, N=6,
     # MLP projection of Adj. matrix. Make sure you remove this when switching to VAE
     mlp_in = nn.Linear(100, d_model)
 
-    edge_mlp = nn.Sequential(
+    output_theta = nn.Sequential(
                     nn.Linear(d_model, 128),
                     nn.ReLU(),
                     nn.Linear(128, 128),
-                    nn.ReLU())
+                    nn.ReLU(),
+                    nn.Linear(128, d_out))
 
-    output_theta = nn.Linear(128, 20)
-    output_alpha = nn.Linear(128, 20)
+    output_alpha = nn.Sequential(
+                    nn.Linear(d_model, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, d_out))
 
     model = graph_decoder(
         Decoder(DecoderLayer(d_model, c(attn),
                              c(ff), dropout), N),
         mlp_in,
-        edge_mlp,
         output_theta,
         output_alpha)
 
