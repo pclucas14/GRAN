@@ -184,8 +184,7 @@ class GRANMixtureBernoulli(nn.Module):
         nn.ReLU(inplace=True),
         nn.Linear(self.hidden_dim, self.hidden_dim),
         nn.ReLU(inplace=True),
-        nn.Linear(self.hidden_dim, self.num_mix_component),
-        nn.LogSoftmax(dim=1))
+        nn.Linear(self.hidden_dim, self.num_mix_component))
 
     if self.dimension_reduce:
       self.embedding_dim = config.model.embedding_dim
@@ -206,6 +205,7 @@ class GRANMixtureBernoulli(nn.Module):
     pos_weight = torch.ones([1]) * self.edge_weight
     self.adj_loss_func = nn.BCEWithLogitsLoss(
         pos_weight=pos_weight, reduction='none')
+
 
   def _inference(self,
                  A_pad=None,
@@ -375,7 +375,7 @@ class GRANMixtureBernoulli(nn.Module):
           log_theta = log_theta.transpose(1, 2)  # B X (ii+K) X K X L
 
           log_alpha = log_alpha.view(B, -1, self.num_mix_component)  # B X K X (ii+K)
-          prob_alpha = log_alpha.mean(dim=1).exp()
+          prob_alpha = F.softmax(log_alpha.mean(dim=1), -1)
           alpha = torch.multinomial(prob_alpha, 1).squeeze(dim=1).long()
 
           prob = []
@@ -525,6 +525,7 @@ def mixture_bernoulli_loss(label, log_theta, log_alpha, adj_loss_func,
 
   # normalization of the alphas ?
   reduce_log_alpha = reduce_log_alpha / const.view(-1, 1)
+  reduce_log_alpha = F.log_softmax(reduce_log_alpha, -1)
 
   log_prob = -reduce_adj_loss + reduce_log_alpha
   log_prob = torch.logsumexp(log_prob, dim=1)

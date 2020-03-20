@@ -268,9 +268,8 @@ class GRANData(object):
       ### adjust index basis for the selected subgraphs
       cum_size = np.cumsum([0] + subgraph_size).astype(np.int64)
       for ii in range(len(edges)):
-        # edges[ii] += cum_size[ii]
         edges[ii] = edges[ii] + cum_size[ii]
-        node_idx_gnn[ii] += cum_size[ii]
+        node_idx_gnn[ii] = node_idx_gnn[ii] + cum_size[ii]
 
       ### pack tensors
       data = {}
