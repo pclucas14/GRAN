@@ -73,11 +73,11 @@ def evaluate(graph_gt, graph_pred, degree_only=True):
     mmd_4orbits = 0.0
     mmd_clustering = 0.0
     mmd_spectral = 0.0
-  else:    
+  else:
     mmd_4orbits = orbit_stats_all(graph_gt, graph_pred)
-    mmd_clustering = clustering_stats(graph_gt, graph_pred)    
+    mmd_clustering = clustering_stats(graph_gt, graph_pred)
     mmd_spectral = spectral_stats(graph_gt, graph_pred)
-    
+
   return mmd_degree, mmd_clustering, mmd_4orbits, mmd_spectral
 
 
@@ -109,7 +109,7 @@ class GranRunner(object):
 
     ### load graphs
     self.graphs = create_graphs(config.dataset.name, data_dir=config.dataset.data_path)
-    
+
     self.train_ratio = config.dataset.train_ratio
     self.dev_ratio = config.dataset.dev_ratio
     self.block_size = config.model.block_size
@@ -131,21 +131,21 @@ class GranRunner(object):
     self.graphs_train = self.graphs[:self.num_train]
     self.graphs_dev = self.graphs[:self.num_dev]
     self.graphs_test = self.graphs[self.num_train:]
-    
+
     self.config.dataset.sparse_ratio = compute_edge_ratio(self.graphs_train)
     logger.info('No Edges vs. Edges in training set = {}'.format(
         self.config.dataset.sparse_ratio))
 
-    self.num_nodes_pmf_train = np.bincount([len(gg.nodes) for gg in self.graphs_train])    
+    self.num_nodes_pmf_train = np.bincount([len(gg.nodes) for gg in self.graphs_train])
     self.max_num_nodes = len(self.num_nodes_pmf_train)
     self.num_nodes_pmf_train = self.num_nodes_pmf_train / self.num_nodes_pmf_train.sum()
-    
+
     ### save split for benchmarking
-    if config.dataset.is_save_split:      
+    if config.dataset.is_save_split:
       base_path = os.path.join(config.dataset.data_path, 'save_split')
       if not os.path.exists(base_path):
         os.makedirs(base_path)
-      
+
       save_graph_list(
           self.graphs_train,
           os.path.join(base_path, '{}_train.p'.format(config.dataset.name)))
@@ -169,6 +169,7 @@ class GranRunner(object):
 
     # create models
     model = eval(self.model_conf.name)(self.config)
+    print('number of parameters : {}'.format(sum([np.prod(x.shape) for x in model.parameters()])))
 
     if self.use_gpu:
       model = DataParallel(model, device_ids=self.gpus).to(self.device)
@@ -187,8 +188,10 @@ class GranRunner(object):
       raise ValueError("Non-supported optimizer!")
 
     early_stop = EarlyStopper([0.0], win_size=100, is_decrease=False)
+
+    from copy import deepcopy
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
+        deepcopy(optimizer),
         milestones=self.train_conf.lr_decay_epoch,
         gamma=self.train_conf.lr_decay)
 
@@ -209,11 +212,12 @@ class GranRunner(object):
       resume_epoch = self.train_conf.resume_epoch
 
     # Training Loop
-    iter_count = 0    
+    iter_count = 0
     results = defaultdict(list)
     for epoch in range(resume_epoch, self.train_conf.max_epoch):
+      has_sampled = False
       model.train()
-      lr_scheduler.step()
+      # lr_scheduler.step()
       train_iterator = train_loader.__iter__()
 
       for inner_iter in range(len(train_loader) // self.num_gpus):
@@ -225,16 +229,16 @@ class GranRunner(object):
             data = train_iterator.next()
             batch_data.append(data)
             iter_count += 1
-        
-        
-        avg_train_loss = .0        
+
+
+        avg_train_loss = .0
         for ff in range(self.dataset_conf.num_fwd_pass):
           batch_fwd = []
-          
+
           if self.use_gpu:
             for dd, gpu_id in enumerate(self.gpus):
               data = {}
-              data['adj'] = batch_data[dd][ff]['adj'].pin_memory().to(gpu_id, non_blocking=True)          
+              data['adj'] = batch_data[dd][ff]['adj'].pin_memory().to(gpu_id, non_blocking=True)
               data['edges'] = batch_data[dd][ff]['edges'].pin_memory().to(gpu_id, non_blocking=True)
               data['node_idx_gnn'] = batch_data[dd][ff]['node_idx_gnn'].pin_memory().to(gpu_id, non_blocking=True)
               data['node_idx_feat'] = batch_data[dd][ff]['node_idx_feat'].pin_memory().to(gpu_id, non_blocking=True)
@@ -244,19 +248,19 @@ class GranRunner(object):
               batch_fwd.append((data,))
 
           if batch_fwd:
-            train_loss = model(*batch_fwd).mean()              
-            avg_train_loss += train_loss              
+            train_loss = model(*batch_fwd).mean()
+            avg_train_loss += train_loss
 
             # assign gradient
             train_loss.backward()
-        
+
         # clip_grad_norm_(model.parameters(), 5.0e-0)
         optimizer.step()
         avg_train_loss /= float(self.dataset_conf.num_fwd_pass)
-        
+
         # reduce
         train_loss = float(avg_train_loss.data.cpu().numpy())
-        
+
         self.writer.add_scalar('train_loss', train_loss, iter_count)
         results['train_loss'] += [train_loss]
         results['train_step'] += [iter_count]
@@ -268,18 +272,34 @@ class GranRunner(object):
       if (epoch + 1) % self.train_conf.snapshot_epoch == 0:
         logger.info("Saving Snapshot @ epoch {:04d}".format(epoch + 1))
         snapshot(model.module if self.use_gpu else model, optimizer, self.config, epoch + 1, scheduler=lr_scheduler)
-    
+
+      if (epoch + 1) % 20 == 0 and not has_sampled:
+          has_sampled = True
+          print('saving graphs')
+          model.eval()
+          graphs_gen = [get_graph(aa.cpu().data.numpy()) for aa in model.module._sampling(10)]
+          model.train()
+
+          vis_graphs = []
+          for gg in graphs_gen:
+            CGs = [gg.subgraph(c) for c in nx.connected_components(gg)]
+            CGs = sorted(CGs, key=lambda x: x.number_of_nodes(), reverse=True)
+            vis_graphs += [CGs[0]]
+
+          total = len(vis_graphs) #min(3, len(vis_graphs))
+          draw_graph_list(vis_graphs[:total], 2, int(total // 2), fname='sample/gran_%d.png' % epoch, layout='spring')
+
     pickle.dump(results, open(os.path.join(self.config.save_dir, 'train_stats.p'), 'wb'))
     self.writer.close()
-    
+
     return 1
 
   def test(self):
     self.config.save_dir = self.test_conf.test_model_dir
 
-    ### Compute Erdos-Renyi baseline    
+    ### Compute Erdos-Renyi baseline
     if self.config.test.is_test_ER:
-      p_ER = sum([aa.number_of_edges() for aa in self.graphs_train]) / sum([aa.number_of_nodes() ** 2 for aa in self.graphs_train])      
+      p_ER = sum([aa.number_of_edges() for aa in self.graphs_train]) / sum([aa.number_of_nodes() ** 2 for aa in self.graphs_train])
       graphs_gen = [nx.fast_gnp_random_graph(self.max_num_nodes, p_ER, seed=ii) for ii in range(self.num_test_gen)]
     else:
       ### load model
@@ -299,7 +319,7 @@ class GranRunner(object):
 
       gen_run_time = []
       for ii in tqdm(range(num_test_batch)):
-        with torch.no_grad():        
+        with torch.no_grad():
           start_time = time.time()
           input_dict = {}
           input_dict['is_sampling']=True
@@ -312,7 +332,7 @@ class GranRunner(object):
 
       logger.info('Average test time per mini-batch = {}'.format(
           np.mean(gen_run_time)))
-          
+
       graphs_gen = [get_graph(aa) for aa in A_pred]
 
     ### Visualize Generated Graphs
@@ -332,7 +352,7 @@ class GranRunner(object):
 
       # display the largest connected component for better visualization
       vis_graphs = []
-      for gg in graphs_pred_vis:        
+      for gg in graphs_pred_vis:
         CGs = [gg.subgraph(c) for c in nx.connected_components(gg)]
         CGs = sorted(CGs, key=lambda x: x.number_of_nodes(), reverse=True)
         vis_graphs += [CGs[0]]
@@ -351,7 +371,7 @@ class GranRunner(object):
             num_col,
             fname=save_name,
             layout='spring')
-      else:      
+      else:
         draw_graph_list_separate(
             self.graphs_train[:self.num_vis],
             fname=save_name[:-4],
@@ -364,13 +384,13 @@ class GranRunner(object):
       logger.info('Validity accuracy of generated graphs = {}'.format(acc))
 
     num_nodes_gen = [len(aa) for aa in graphs_gen]
-    
-    # Compared with Validation Set    
+
+    # Compared with Validation Set
     num_nodes_dev = [len(gg.nodes) for gg in self.graphs_dev]  # shape B X 1
     mmd_degree_dev, mmd_clustering_dev, mmd_4orbits_dev, mmd_spectral_dev = evaluate(self.graphs_dev, graphs_gen, degree_only=False)
     mmd_num_nodes_dev = compute_mmd([np.bincount(num_nodes_dev)], [np.bincount(num_nodes_gen)], kernel=gaussian_emd)
 
-    # Compared with Test Set    
+    # Compared with Test Set
     num_nodes_test = [len(gg.nodes) for gg in self.graphs_test]  # shape B X 1
     mmd_degree_test, mmd_clustering_test, mmd_4orbits_test, mmd_spectral_test = evaluate(self.graphs_test, graphs_gen, degree_only=False)
     mmd_num_nodes_test = compute_mmd([np.bincount(num_nodes_test)], [np.bincount(num_nodes_gen)], kernel=gaussian_emd)

@@ -117,6 +117,8 @@ class GRANData(object):
     if self.num_canonical_order == 5:
       adj_list = [adj_0, adj_1, adj_3, adj_4, adj_5]
     else:
+      if self.node_order == 'original':
+        adj_list = [adj_0]
       if self.node_order == 'degree_decent':
         adj_list = [adj_1]
       elif self.node_order == 'degree_accent':

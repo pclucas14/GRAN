@@ -216,7 +216,7 @@ class TransformerRunner(object):
     # create models
     # model = eval(self.model_conf.name)(self.config)
     from model.transformer import make_model
-    model = make_model(d_out=1, N=10, d_model=256, d_ff=32, dropout=0.5) # d_out, N, d_model, d_ff, h
+    model = make_model(d_out=1, N=10, d_model=32, d_ff=32, dropout=0.5) # d_out, N, d_model, d_ff, h
 
     if self.use_gpu:
       model = DataParallel(model, device_ids=self.gpus).to(self.device)

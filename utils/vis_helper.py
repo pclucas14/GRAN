@@ -53,7 +53,7 @@ def draw_graph_list(G_list,
       nx.draw_networkx_edges(G, pos, alpha=0.3, width=0.2)
 
   plt.tight_layout()
-  plt.savefig(fname, dpi=300)
+  plt.savefig(fname, dpi=150) #300)
   plt.close()
 
 
@@ -65,10 +65,10 @@ def draw_graph_list_separate(G_list,
                     node_size=55,
                     alpha=1,
                     width=1.3):
-  
+
   for i, G in enumerate(G_list):
     plt.switch_backend('agg')
-    
+
     plt.axis("off")
 
     # turn off axis label
