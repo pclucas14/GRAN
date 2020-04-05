@@ -30,7 +30,6 @@ class graph_decoder(nn.Module):
         self.self_loop  = SELF_LOOP
 
     def mix_bern_loss(self, log_theta, log_alpha, adj, lens):
-
         B, N, K = log_theta.size()
         adj = adj.squeeze(1)
 
@@ -66,7 +65,8 @@ class graph_decoder(nn.Module):
         log_alpha = log_alpha * valid_edges.unsqueeze(-1)
 
         # average over pooled nodes
-        log_alpha = log_alpha.sum(1) / lens.view(-1, 1)
+        log_alpha = log_alpha.sum(1) / (lens + 1).view(-1, 1)
+        # log_alpha = log_alpha.sum(1) / lens.view(-1, 1)
         log_alpha = F.log_softmax(log_alpha, -1)
 
         log_prob = -adj_loss + log_alpha
@@ -85,20 +85,26 @@ class graph_decoder(nn.Module):
             attn_mask = torch.zeros(1, max_node, max_node).to(adj.device)
             valid_edges = torch.zeros(1, max_node).to(adj.device)
 
+
             # assuming no self loops, we can start at the second node (i = 1)
             ### TODO: put this bach
-            for ii in range(1, 50): #max_node):
+            for ii in range(1, max_node):
 
                 # rows ii: are already zeros (line 82)
                 node_feat = adj.float()
 
+                attn_mask = adj.clone()
+
                 # add dummy edges
-                attn_mask[:, ii, :ii+1] = 1
-                attn_mask[:, :ii+1, ii] = 1
+                # attn_mask[:, ii, :ii+1] = 1
+                # attn_mask[:, :ii+1, ii] = 1
+                # FULLY CONNECETD SET OF EDGES
+                attn_mask = torch.zeros_like(attn_mask)
+                attn_mask[:, :ii+1, :ii+1] = 1
 
                 # add self loops
                 # to not include self connection, uncomment this line
-                attn_mask[:, torch.arange(ii), torch.arange(ii)] = 1
+                # attn_mask[:, torch.arange(ii), torch.arange(ii)] = 1
 
                 usq = lambda x : x.unsqueeze(1)
                 lens = torch.ones(n_samples).to(node_feat.device) * ii
@@ -111,7 +117,8 @@ class graph_decoder(nn.Module):
 
                 # mask out irrelevant tokens
                 log_alpha = log_alpha * valid_edges.unsqueeze(-1)
-                log_alpha = log_alpha.sum(1) / ii
+                log_alpha = log_alpha.sum(1) / (ii + 1)
+                # log_alpha = log_alpha.sum(1) / ii
                 alpha     = F.softmax(log_alpha, -1)
                 alpha     = torch.multinomial(alpha, 1).squeeze(1)
 
@@ -119,9 +126,7 @@ class graph_decoder(nn.Module):
                 log_theta = log_theta[:, :ii+1]
 
                 # Temperature tuning
-                log_theta = log_theta * 2
-
-
+                # log_theta = log_theta * 2
                 theta     = torch.sigmoid(log_theta)
 
                 sampled_edges = torch.bernoulli(theta)
@@ -199,11 +204,13 @@ class SublayerConnection(nn.Module):
         super(SublayerConnection, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
+        self.resweight = nn.Parameter(torch.Tensor([0]))
+
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        xx = 1
-        return x + self.dropout(sublayer(self.norm(x)))
+        # return x + self.dropout(sublayer(self.norm(x)))
+        return x + self.resweight * self.dropout(sublayer(self.norm(x)))
 
 
 class Decoder(nn.Module):
@@ -292,6 +299,40 @@ class MultiHeadedAttention(nn.Module):
         return self.linears[-1](x)
 
 
+class MultiHeadedAttention_(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
+
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(query, key, value, mask=mask,
+                                 dropout=self.dropout)
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = x.transpose(1, 2).contiguous() \
+             .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
     def __init__(self, d_model, d_ff, dropout=0.1):
@@ -305,14 +346,14 @@ class PositionwiseFeedForward(nn.Module):
 
 
 def make_model(d_out=100, N=6,
-        d_model=512, d_ff=2048, h=8, dropout=0.3): # 0.1):
+        d_model=512, d_ff=2048, h=8, dropout=0.3, max_node=100): # 0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
 
     # MLP projection of Adj. matrix. Make sure you remove this when switching to VAE
-    mlp_in = nn.Linear(100, d_model)
+    mlp_in = nn.Linear(max_node, d_model)
 
     output_theta = nn.Sequential(
                     nn.Linear(d_model, 128),

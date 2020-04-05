@@ -107,6 +107,8 @@ def preprocess(data, lens):
 
     # (include self connections)
     attn_mask = (data + diag) * len_m1_mask
+    # FULLY CONNECTED SET OF EDGES
+    # attn_mask = data * len_m1_mask
 
     # (to not include self connection : )
     # attn_mask = data * len_m1_mask
@@ -216,7 +218,10 @@ class TransformerRunner(object):
     # create models
     # model = eval(self.model_conf.name)(self.config)
     from model.transformer import make_model
-    model = make_model(d_out=1, N=10, d_model=32, d_ff=32, dropout=0.5) # d_out, N, d_model, d_ff, h
+    model = make_model(max_node=self.config.model.max_num_nodes,
+            d_out=20, N=7, d_model=64, d_ff=64, dropout=0.4) # d_out, N, d_model, d_ff, h
+            # d_out=20, N=15, d_model=16, d_ff=16, dropout=0.2) # d_out, N, d_model, d_ff, h
+            # d_out=20, N=3, d_model=64, d_ff=64, dropout=0.1) # d_out, N, d_model, d_ff, h
 
     if self.use_gpu:
       model = DataParallel(model, device_ids=self.gpus).to(self.device)
@@ -283,8 +288,9 @@ class TransformerRunner(object):
 
               adj, lens = data['adj'], data['lens']
 
-              adj = adj[:, :, :100, :100]
-              lens = [min(99, x) for x in lens]
+              # this is only for grid
+              # adj = adj[:, :, :100, :100]
+              # lens = [min(99, x) for x in lens]
 
               adj  = adj.to('cuda:%d' % gpu_id)
 
@@ -320,7 +326,7 @@ class TransformerRunner(object):
         if epoch % 50 == 0 and inner_iter == 0:
           model.eval()
           print('saving graphs')
-          graphs_gen = [get_graph(adj[0].cpu().data.numpy())] + [get_graph(aa.cpu().data.numpy()) for aa in model.module.sample(9)]
+          graphs_gen = [get_graph(adj[0].cpu().data.numpy())] + [get_graph(aa.cpu().data.numpy()) for aa in model.module.sample(19, max_node=self.config.model.max_num_nodes)]
           model.train()
 
           vis_graphs = []
@@ -332,8 +338,11 @@ class TransformerRunner(object):
             except:
                 pass
 
-          total = len(vis_graphs) #min(3, len(vis_graphs))
-          draw_graph_list(vis_graphs[:total], 2, int(total // 2), fname='sample/trans_sl:%d_%d.png' % (int(model.module.self_loop), epoch), layout='spring')
+          try:
+            total = len(vis_graphs) #min(3, len(vis_graphs))
+            draw_graph_list(vis_graphs[:total], 4, int(total // 4), fname='sample/trans_sl:%d_%d.png' % (int(model.module.self_loop), epoch), layout='spring')
+          except:
+            print('sample saving failed')
 
 
       # snapshot model
